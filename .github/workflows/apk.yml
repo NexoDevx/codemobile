@@ -1,0 +1,235 @@
+name: CodeMobile · Linux, testes, Android SDK e APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_linux:
+        description: Incluir o Linux ARM64 completo no APK
+        required: true
+        type: boolean
+        default: true
+      run_alpine_smoke:
+        description: Iniciar Alpine e validar o conjunto de ferramentas
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: codemobile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Testes do CodeMobile (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package.json
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+      - name: Executar suíte completa
+        run: npm test
+      - name: Validar sintaxe dos módulos web
+        run: |
+          for f in www/*.js server.mjs; do node --check "$f"; done
+      - name: Validar workflow e configuração
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('package.json','utf8')); JSON.parse(require('fs').readFileSync('capacitor.config.json','utf8'));"
+
+  linux-runtime:
+    name: Inicializar Linux Alpine e instalar toolchain
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_alpine_smoke != false }}
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Inicializar Alpine 3.24.4 e instalar o mesmo conjunto base do APK
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" -w /workspace \
+            alpine:3.24.4 sh -euxc '
+              apk update
+              apk add --no-cache ca-certificates bash bash-completion git git-lfs \
+                python3 py3-pip py3-virtualenv nodejs npm ripgrep fd fzf jq yq tree \
+                curl wget openssh zip unzip tar xz vim nano make cmake ninja build-base \
+                clang pkgconf diffutils coreutils findutils grep sed gawk less htop ncdu sqlite \
+                openjdk17-jdk
+              update-ca-certificates
+              echo "=== Linux iniciado ==="
+              cat /etc/alpine-release
+              uname -m
+              apk info -v | wc -l
+              node --version
+              npm --version
+              java -version
+              git --version
+              python3 --version
+              curl -fsSI --max-time 20 https://dl-cdn.alpinelinux.org/alpine/ >/dev/null
+              echo "=== Rede, DNS, apk, Java, Node e ferramentas OK ==="
+              npm install --no-audit --no-fund
+              npm test
+            '
+
+  android-apk:
+    name: Android SDK + Build Tools + Linux ARM64 + APK
+    needs: [tests, linux-runtime]
+    if: ${{ always() && needs.tests.result == 'success' && (needs.linux-runtime.result == 'success' || needs.linux-runtime.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANDROID_API: '34'
+      ANDROID_BUILD_TOOLS: '34.0.0'
+      ALPINE_VERSION: '3.24.4'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package.json
+      - name: Java 17 (compatível com AGP 8.2.x)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Instalar Android SDK Command-line Tools, Platform e Build Tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+      - name: Instalar dependências web
+        run: npm install --no-audit --no-fund
+      - name: Criar ou atualizar plataforma Capacitor Android
+        run: |
+          if [ ! -d android ]; then npx cap add android; fi
+          npx cap sync android
+      # O projeto Android e seus arquivos Gradle só existem depois do cap add/sync.
+      # setup-gradle precisa encontrar settings.gradle/build.gradle ou o Wrapper.
+      - name: Configurar cache e validação Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+      - name: Confirmar SDK e ferramentas instaladas
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          test -x "$ANDROID_HOME/platform-tools/adb"
+          test -d "$ANDROID_HOME/platforms/android-$ANDROID_API"
+          test -d "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS"
+          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/aapt" version
+          test -x "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/zipalign"
+          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner" version
+          java -version
+      - name: Permissões Android de rede e armazenamento nativo
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          m = re.search(r'<manifest\b[^>]*>', s)
+          if not m:
+              raise SystemExit('AndroidManifest.xml sem elemento manifest')
+          for permission in ('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE'):
+              if permission not in s:
+                  s = s[:m.end()] + f'\n    <uses-permission android:name="{permission}" />' + s[m.end():]
+          if 'android:usesCleartextTraffic=' not in s:
+              s = re.sub(r'<application\b', '<application android:usesCleartextTraffic="true" android:extractNativeLibs="true"', s, count=1)
+          p.write_text(s)
+          PY
+      - name: Preparar plugin de arquivos
+        run: |
+          APP=android/app/src/main
+          PKG="$APP/java/com/codemobile/app"
+          mkdir -p "$PKG"
+          cp native/FolderPlugin.java "$PKG/FolderPlugin.java"
+      - name: Montar Linux Alpine ARM64 verificado para o APK
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_linux != false }}
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/codemobile-linux"
+          APP=android/app/src/main
+          PKG="$APP/java/com/codemobile/app"
+          JNI="$APP/jniLibs/arm64-v8a"
+          mkdir -p "$W" "$JNI" "$APP/assets"
+
+          git clone --depth 1 https://github.com/green-green-avk/build-proot-android "$W/proot-src"
+          echo "PRoot source commit: $(git -C "$W/proot-src" rev-parse HEAD)"
+          P=$(find "$W/proot-src/packages" -maxdepth 1 -type f -iname '*aarch64*' | sort | head -n 1)
+          test -n "$P"
+          mkdir -p "$W/proot"
+          tar -xf "$P" -C "$W/proot"
+          PROOT=$(find "$W/proot" -type f -path '*/bin/proot' | head -n 1)
+          LOADER=$(find "$W/proot" -type f -path '*/libexec/proot/loader' | head -n 1)
+          test -n "$PROOT" && test -n "$LOADER"
+          file "$PROOT" "$LOADER"
+          file "$PROOT" | grep -Eqi 'ARM aarch64|aarch64'
+
+          # Alpine publishes point releases (e.g. 3.24.4) under the series directory (v3.24).
+          ALPINE_SERIES="${ALPINE_VERSION%.*}"
+          BASE="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_SERIES}/releases/aarch64"
+          ROOTFS="alpine-minirootfs-${ALPINE_VERSION}-aarch64.tar.gz"
+          curl --fail --location --retry 4 --retry-all-errors "$BASE/$ROOTFS" -o "$W/$ROOTFS"
+          curl --fail --location --retry 4 --retry-all-errors "$BASE/$ROOTFS.sha256" -o "$W/$ROOTFS.sha256"
+          (cd "$W" && sha256sum -c "$ROOTFS.sha256")
+          mv "$W/$ROOTFS" "$W/rootfs.bin"
+          tar -tzf "$W/rootfs.bin" | grep -Eq '(^|/)etc/alpine-release$'
+
+          install -m 0755 "$PROOT" "$JNI/libproot.so"
+          install -m 0755 "$LOADER" "$JNI/libproot-loader.so"
+          install -m 0644 "$W/rootfs.bin" "$APP/assets/rootfs.bin"
+          cp native/ShellPlugin.java "$PKG/ShellPlugin.java"
+          echo "Alpine ${ALPINE_VERSION} ARM64 + PRoot preparados e verificados." >> "$GITHUB_STEP_SUMMARY"
+          echo "Rootfs SHA-256: $(sha256sum "$W/rootfs.bin" | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Registrar plugins nativos sem fallback silencioso
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          pkg = Path('android/app/src/main/java/com/codemobile/app')
+          names = [n for n in ('ShellPlugin', 'FolderPlugin') if (pkg / (n + '.java')).exists()]
+          imports = ''.join(f'import com.codemobile.app.{n};\n' for n in names)
+          regs = ''.join(f'    registerPlugin({n}.class);\n' for n in names)
+          code = 'package com.codemobile.app;\n\nimport android.os.Bundle;\nimport com.getcapacitor.BridgeActivity;\n' + imports + '\npublic class MainActivity extends BridgeActivity {\n  @Override public void onCreate(Bundle savedInstanceState) {\n' + regs + '    super.onCreate(savedInstanceState);\n  }\n}\n'
+          (pkg / 'MainActivity.java').write_text(code)
+          print('Plugins registrados:', ', '.join(names) if names else 'nenhum')
+          PY
+          npx cap sync android
+      - name: Configurar Gradle para CI estável
+        run: |
+          mkdir -p android
+          touch android/gradle.properties
+          printf '\norg.gradle.caching=true\norg.gradle.parallel=false\norg.gradle.workers.max=2\norg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8\n' >> android/gradle.properties
+      - name: Compilar APK Debug
+        run: |
+          cd android
+          ./gradlew --no-daemon --stacktrace --build-cache assembleDebug
+      - name: Verificar APK, assinatura, SDK e Linux incluído
+        env:
+          EXPECT_LINUX: ${{ github.event_name != 'workflow_dispatch' || inputs.build_linux != false }}
+        run: node scripts/verify-apk.mjs android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Publicar APK e diagnóstico
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeMobile-APK-${{ github.run_number }}
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/debug/output-metadata.json
+          if-no-files-found: error
+          retention-days: 21
